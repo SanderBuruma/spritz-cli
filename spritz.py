@@ -102,9 +102,11 @@ def render(word, orp, cols):
     return line
 
 
-def render_progress(current, total, wpm, cols):
-    """Render progress bar with word count."""
-    label = f" {current}/{total} {wpm}wpm "
+def render_progress(current, total, target_wpm, current_wpm, cols):
+    """Render progress bar with word count and ETA based on target WPM."""
+    remaining = total - current
+    eta = fmt_time(remaining * 60 / max(target_wpm, 1))
+    label = f" {current}/{total} {current_wpm}wpm {eta} left "
     bar_width = cols - len(label) - 4
     if bar_width < 10:
         bar_width = 10
@@ -125,10 +127,32 @@ def render_marker_below(cols):
     return " " * center + "\033[91m▲\033[0m"
 
 
+def fmt_time(seconds):
+    """Format seconds as Xm Ys."""
+    m, s = divmod(int(seconds), 60)
+    if m > 0:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+
+
 def get_key(fd):
-    """Read a single keypress (non-blocking with timeout)."""
+    """Read a single keypress. Returns special strings for ESC and arrow keys."""
+    import select
     ch = os.read(fd, 1)
-    return ch.decode("utf-8", errors="ignore") if ch else ""
+    if not ch:
+        return ""
+    if ch == b'\x1b':
+        # Check if more bytes follow (arrow key sequence) or bare ESC
+        ready, _, _ = select.select([fd], [], [], 0.05)
+        if ready:
+            seq = os.read(fd, 2).decode("utf-8", errors="ignore")
+            if seq == "[C":
+                return "RIGHT"
+            elif seq == "[D":
+                return "LEFT"
+            return ""  # unknown escape sequence
+        return "ESC"  # bare escape key
+    return ch.decode("utf-8", errors="ignore")
 
 
 def main():
@@ -179,14 +203,13 @@ def main():
 
             # Progress bar
             sys.stdout.write(f"\033[{mid_row + 3};1H")
-            sys.stdout.write(render_progress(idx + 1, total, current_wpm, cols))
+            sys.stdout.write(render_progress(idx + 1, total, target_wpm, current_wpm, cols))
 
             # Pause indicator
             if paused:
-                pause_text = "\033[93m⏸  PAUSED — space to start, q/e speed, ←/→ skip, ^C quit\033[0m"
+                pause_text = "\033[93m⏸  PAUSED — space to start, q/e speed, ←/→ skip, s quit\033[0m"
                 sys.stdout.write(f"\033[{mid_row + 5};1H")
-                # Center it
-                vis_len = len("⏸  PAUSED — space to start, q/e speed, ←/→ skip, ^C quit")
+                vis_len = len("⏸  PAUSED — space to start, q/e speed, ←/→ skip, s quit")
                 pad = max(0, (cols - vis_len) // 2)
                 sys.stdout.write(" " * pad + pause_text)
 
@@ -199,26 +222,21 @@ def main():
                     if ch == " ":
                         paused = False
                         break
-                    elif ch == "\x03":  # Ctrl+C
+                    elif ch in ("\x03", "ESC", "s"):
                         raise KeyboardInterrupt
                     elif ch == "e":
                         target_wpm = min(target_wpm + args.step, 2000)
-                        break  # Re-render
+                        break
                     elif ch == "q":
                         target_wpm = max(target_wpm - args.step, args.min_wpm)
-                        break  # Re-render
-                    elif ch == "\x1b":  # Escape sequence (arrow keys)
-                        seq = os.read(fd, 2).decode("utf-8", errors="ignore")
-                        if seq == "[C":  # Right arrow
-                            idx = min(idx + 1, total - 1)
-                            break
-                        elif seq == "[D":  # Left arrow
-                            idx = max(idx - 1, 0)
-                            break
-                    # Ignore other keys while paused, keep waiting
-                    else:
-                        continue
-                continue  # Re-render after any key in paused state
+                        break
+                    elif ch == "RIGHT":
+                        idx = min(idx + 1, total - 1)
+                        break
+                    elif ch == "LEFT":
+                        idx = max(idx - 1, 0)
+                        break
+                continue
 
             # Playing: wait for word duration, check for input
             delay = 60.0 / max(current_wpm, 1)
@@ -234,7 +252,6 @@ def main():
             deadline = time.monotonic() + delay
 
             while time.monotonic() < deadline:
-                # Non-blocking input check
                 import select
                 ready, _, _ = select.select([fd], [], [], 0.01)
                 if ready:
@@ -242,20 +259,18 @@ def main():
                     if ch == " ":
                         paused = True
                         break
-                    elif ch == "\x03":
+                    elif ch in ("\x03", "ESC", "s"):
                         raise KeyboardInterrupt
                     elif ch == "e":
                         target_wpm = min(target_wpm + args.step, 2000)
                     elif ch == "q":
                         target_wpm = max(target_wpm - args.step, args.min_wpm)
-                    elif ch == "\x1b":
-                        seq = os.read(fd, 2).decode("utf-8", errors="ignore")
-                        if seq == "[C":  # Right
-                            idx = min(idx + 10, total - 1)
-                            break
-                        elif seq == "[D":  # Left
-                            idx = max(idx - 10, 0)
-                            break
+                    elif ch == "RIGHT":
+                        idx = min(idx + 10, total - 1)
+                        break
+                    elif ch == "LEFT":
+                        idx = max(idx - 10, 0)
+                        break
 
             if not paused:
                 idx += 1
@@ -269,7 +284,7 @@ def main():
         pad = (cols - len(done_msg)) // 2
         sys.stdout.write(f"\033[{mid_row};1H" + " " * pad + "\033[92m" + done_msg + "\033[0m")
         sys.stdout.write(f"\033[{mid_row + 2};1H")
-        sys.stdout.write(render_progress(total, total, target_wpm, cols))
+        sys.stdout.write(render_progress(total, total, target_wpm, target_wpm, cols))
         sys.stdout.flush()
         # Wait for any key
         os.read(fd, 1)
